@@ -27,6 +27,26 @@ go.work.sum
 # env file
 .env
 
-# Editor/IDE
-# .idea/
-# .vscode/
+
+# IDE and Editor specifics
+.vscode/
+.idea/
+*.swp
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Build binaries (You don't commit the executable, only the source)
+# Since you are compiling to 'tcplistener' or similar
+tcplistener
+*.exe
+*.o
+*.out
+
+# Temporary execution files (The one you asked about)
+tempCodeRunnerFile.go
+
+# Logs (If you are logging to files)
+*.log
+/tmp/
