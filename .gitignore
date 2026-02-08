@@ -39,7 +39,6 @@ Thumbs.db
 
 # Build binaries (You don't commit the executable, only the source)
 # Since you are compiling to 'tcplistener' or similar
-tcplistener
 *.exe
 *.o
 *.out
