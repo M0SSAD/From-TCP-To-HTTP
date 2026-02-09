@@ -19,25 +19,28 @@ func getLinesChannel(f io.ReadCloser) <-chan string {
 		data := make([]byte, 8)
 		for {
 			n, err := f.Read(data)
+			var chunk []byte
+			if n > 0 {
+				chunk = data[:n]
+				for {
+					i := bytes.IndexByte(chunk, '\n')
+					if i == -1 {
+						break 
+					}
+					str += string(chunk[:i])
+					s <- str
+					str = ""
+					chunk = chunk[i+1:]
+					time.Sleep(500 * time.Millisecond) //Just to visualise the pipelining
+				}
+				str += string(chunk)
+			}
 			if err != nil {
 				if err != io.EOF {
 					fmt.Println("Read error:", err) // Log it, don't crash
 				}
 				break
 			}
-			chunk := data[:n]
-			for {
-				i := bytes.IndexByte(chunk, '\n')
-				if i == -1 {
-					break 
-				}
-				str += string(chunk[:i])
-				s <- str
-				str = ""
-				chunk = chunk[i+1:]
-				time.Sleep(500 * time.Millisecond) //Just to visualise the pipelining
-			}
-			str += string(chunk)
 		}
 		if len(str) != 0 {
 			s <- str

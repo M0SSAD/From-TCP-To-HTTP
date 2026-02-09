@@ -217,6 +217,29 @@ func main() {
 
 *While reading from a file you pull the bytes from a file, but when reading from a network you get pushed with the data*
 
+### Files vs. Network: The Stream Abstraction
+
+**1. The "Everything is a Stream" Philosophy**
+- **Insight:** To my code, a file on the disk and a TCP connection to a server are identical. They are just streams of bytes.
+- **The Interface Magic:** This is why Go's `io.Reader` and `io.Writer` are so powerful.
+  - Because my `getLinesChannel` function accepts an `io.ReadCloser`, it didn't care if I passed it `os.File` or `net.Conn`.
+  - It treats them both as "something I can read bytes from."
+
+**2. The Critical Difference: Pull vs. Push**
+
+While the *interface* is the same, the *control flow* is radically different.
+
+| Feature | Files (Pull) | Network (Push) |
+| :--- | :--- | :--- |
+| **Control** | **I am in control.** | **The Sender is in control.** |
+| **Timing** | I decide when to read. | Data arrives whenever it wants. |
+| **Amount** | I decide how much to read. | I get whatever the network delivers. |
+| **Stopping** | I stop when I hit EOF. | I stop only when the connection dies. |
+
+**The Engineering Implication:**
+- With files, I "pull" data at my own pace.
+- With networks, data is "pushed" to me. My code must be **reactive**. It must sit and wait (block) until the data arrives. This is why Concurrency (Goroutines) became necessary immediately after we switched to TCP—we have to wait for data without freezing the whole program.
+  
 **Next Step:** I will swap the `os.File` for a `net.Conn`. The parsing logic I just wrote shouldn't know the difference.
 
 *When data is sent over a network, it is sent in packets. Each message is split into packets, the packets are sent, they arrive (potentially) out of order, and they are reassembled on the other side. And without a protocol like TCP, you can't guarantee that the order is correct...*
@@ -315,3 +338,145 @@ func main() {
 - We want to see the logs *and* save them to a file for debugging.
 - **Command:** `go run ./cmd/tcplistener | tee /tmp/tcplistener.txt`
 - `tee` splits the output stream: one copy goes to stdout (screen), one copy goes to the file.
+
+### Step 7: The UDP Sender ("Yeet" Protocol)
+
+**The Difference in Setup**
+- **TCP:** Required `ln.Accept()` on the server and `net.Dial` on the client. The handshake had to happen before I could send a single byte.
+- **UDP:** I used `net.ResolveUDPAddr` and `net.DialUDP`.
+  - **Wait, "Dial"?** The name `DialUDP` is a bit of a lie. In UDP, there is no "connection."
+  - When I "dial" UDP, Go just stores the destination IP locally so it knows where to aim the packets. It doesn't send anything to the network yet.
+
+
+
+**The "Connection Refused" Trap**
+- I ran the sender *without* the listener running.
+- **Result:** No error! The program happily sent bytes into the void.
+- **Why?** UDP is "fire and forget." It doesn't care if anyone is listening.
+- **Exception:** Sometimes, if the OS is helpful, it might send back an **ICMP Port Unreachable** message, which causes the *next* write to fail. This is the OS "yeeting" me back.
+
+**Critical Bug: The "Hungry Buffer"**
+- I initially put `bufio.NewReader(os.Stdin)` *inside* my `for` loop.
+- **The specific failure:** `bufio` reads big chunks (4KB) at a time. If I pasted 3 lines of text:
+  1. Reader 1 consumes all 3 lines from Stdin into its buffer.
+  2. It returns Line 1.
+  3. The loop restarts. Reader 1 (holding Lines 2 & 3) is overwritten by Reader 2.
+  4. Reader 2 looks at Stdin, sees it's empty, and waits.
+  5. **Result:** Lines 2 & 3 are lost forever.
+- **Fix:** Always initialize buffered readers *outside* the loop.
+
+```go
+// BAD
+for {
+    reader := bufio.NewReader(os.Stdin) // Creates a new buffer every time
+    text, _ := reader.ReadString('\n')
+}
+
+// GOOD
+reader := bufio.NewReader(os.Stdin) // Buffer created once
+for {
+    text, _ := reader.ReadString('\n') // reuses the same buffer
+}
+```
+**My Code:**
+```Go
+func udpConnection(conn *net.UDPConn) <-chan string {
+	ch := make(chan string)
+	go func(connection *net.UDPConn) {
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			
+			fmt.Printf("> ")
+			str, err := reader.ReadString('\n')
+			
+			if err != nil {
+				fmt.Printf("Error reading input: %s\n", err)
+				break
+			}
+
+			
+			_, err = connection.Write([] byte(str))
+			
+			if err != nil {
+				fmt.Printf("Error writing to UDP: %s\n", err)
+				continue
+			}
+			ch <- str
+		}
+	close(ch)
+	}(conn)
+	return ch
+}
+
+func main() {
+	addr, err := net.ResolveUDPAddr("udp", "localhost:42069")
+
+	if err != nil {
+		fmt.Printf("Error resolving: %s\n", err)
+		return
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+
+	if err != nil {
+		fmt.Printf("Error: %s\n", err)
+		return
+	}
+	defer conn.Close()
+
+	for input := range udpConnection(conn) {
+		fmt.Printf("Sent: %s\n", input)
+	}
+
+}
+```
+
+### Deep Dive: The `net` Library (UDP Edition)
+
+In the UDP sender, I used two specific functions to set up the connection. Here is what they actually do under the hood.
+
+#### 1. `net.ResolveUDPAddr(network, address string)`
+
+* **What it does:**
+    It takes a human-readable string like `"localhost:42069"` and converts it into a `*net.UDPAddr` struct. This involves:
+    1.  **Parsing:** Splitting the IP and Port.
+    2.  **DNS Lookup:** If you give it a domain name (e.g., `google.com`), it asks the DNS server for the IP address.
+    
+* **Why we used it:**
+    The older `net.DialUDP` function *requires* this specific struct type (`*net.UDPAddr`) as an argument. It won't accept a simple string.
+
+#### 2. `net.DialUDP(network string, laddr, raddr *net.UDPAddr)`
+
+* **What it does:**
+    It creates a `net.UDPConn`.
+    * **"Dialing" in UDP:** Unlike TCP, this does **not** send any packets to the network. It simply sets the "default destination" for this socket.
+    * **Effect:** When you later call `conn.Write()`, the OS knows exactly where to send the packet without you having to specify the address every single time.
+    
+* **Arguments:**
+    * `laddr` (Local Address): We passed `nil`. This tells the OS, "I don't care which port I send *from*, just pick an open one."
+    * `raddr` (Remote Address): The target we resolved earlier (`localhost:42069`).
+
+---
+
+### Is there a better way? (The Modern Standard)
+
+Yes. While `ResolveUDPAddr` and `DialUDP` are precise, they are a bit verbose.
+
+In modern Go code, we often prefer the generic **`net.Dial`** function.
+
+```go
+// The "Old" Way (Specific)
+addr, _ := net.ResolveUDPAddr("udp", "localhost:42069")
+conn, _ := net.DialUDP("udp", nil, addr)
+
+// The "New" Way (Standard)
+conn, _ := net.Dial("udp", "localhost:42069")
+```
+
+**Why use `net.Dial` instead?**
+1.  **Polymorphism:** It returns a `net.Conn` interface (same as TCP!). This means I can write code that doesn't care if it's using TCP or UDP.
+2.  **Convenience:** It handles the address resolution (`ResolveUDPAddr`) automatically inside.
+3.  **Refactoring:** If I want to switch to TCP later, I just change the string `"udp"` to `"tcp"`.
+
+**Why did we use the verbose way?**
+To understand the mechanics. `DialUDP` returns a `*net.UDPConn`, which exposes UDP-specific methods (like `ReadFromUDP` and `WriteToUDP`) that give us more control over individual packets, which is critical when building low-level servers.
+
