@@ -1,54 +1,53 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"time"
+
+	"boot.mossad.http/internal/request"
 )
 
-func getLinesChannel(f io.ReadCloser) <-chan string {
-	s := make(chan string, 1)
-	
-	go func() {
-		defer f.Close()
-		defer close(s)
-		str := ""
-		data := make([]byte, 8)
-		for {
-			n, err := f.Read(data)
-			var chunk []byte
-			if n > 0 {
-				chunk = data[:n]
-				for {
-					i := bytes.IndexByte(chunk, '\n')
-					if i == -1 {
-						break 
-					}
-					str += string(chunk[:i])
-					s <- str
-					str = ""
-					chunk = chunk[i+1:]
-					time.Sleep(500 * time.Millisecond) //Just to visualise the pipelining
-				}
-				str += string(chunk)
-			}
-			if err != nil {
-				if err != io.EOF {
-					fmt.Println("Read error:", err) // Log it, don't crash
-				}
-				break
-			}
-		}
-		if len(str) != 0 {
-			s <- str
-		}
-	}()
+// func getLinesChannel(f io.ReadCloser) <-chan string {
+// 	s := make(chan string, 1)
 
-	return s
-}
+// 	go func() {
+// 		defer f.Close()
+// 		defer close(s)
+// 		str := ""
+// 		data := make([]byte, 8)
+// 		for {
+// 			n, err := f.Read(data)
+// 			var chunk []byte
+// 			if n > 0 {
+// 				chunk = data[:n]
+// 				for {
+// 					i := bytes.IndexByte(chunk, '\n')
+// 					if i == -1 {
+// 						break
+// 					}
+// 					str += string(chunk[:i])
+// 					s <- str
+// 					str = ""
+// 					chunk = chunk[i+1:]
+// 					time.Sleep(500 * time.Millisecond) //Just to visualise the pipelining
+// 				}
+// 				str += string(chunk)
+// 			}
+// 			if err != nil {
+// 				if err != io.EOF {
+// 					fmt.Println("Read error:", err) // Log it, don't crash
+// 				}
+// 				break
+// 			}
+// 		}
+// 		if len(str) != 0 {
+// 			s <- str
+// 		}
+// 	}()
+
+// 	return s
+// }
 
 func main() {
 	ln, err := net.Listen("tcp", ":42069")
@@ -64,13 +63,24 @@ func main() {
 			fmt.Println("Error: ", err)
 			continue
 		}
-		fmt.Printf("Connection Has Been Accepted.\n")
+		go func(c net.Conn) {
+			defer c.Close()
+			fmt.Printf("Connection Has Been Accepted.\n")
 
-		for line := range getLinesChannel(conn) {
-			fmt.Printf("read: %s\n", line)
-		}
+			// for line := range getLinesChannel(conn) {
+			// 	fmt.Printf("read: %s\n", line)
+			// }
+			req, err := request.RequestFromReader(c)
 
-		fmt.Printf("Coneection Has Been Closed.\n")
+			if err != nil {
+				fmt.Println("Error Getting Request: ", err)
+				return
+			}
+
+			fmt.Printf("Request line:\n- Method: %s\n- Target: %s\n- Version: %s", req.RequestLine.Method, req.RequestLine.RequestTarget, req.RequestLine.HttpVersion)
+
+			fmt.Printf("\nConeection Has Been Closed.\n")
+		}(conn)
 	}
 	
 }

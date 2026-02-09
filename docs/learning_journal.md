@@ -480,3 +480,422 @@ conn, _ := net.Dial("udp", "localhost:42069")
 **Why did we use the verbose way?**
 To understand the mechanics. `DialUDP` returns a `*net.UDPConn`, which exposes UDP-specific methods (like `ReadFromUDP` and `WriteToUDP`) that give us more control over individual packets, which is critical when building low-level servers.
 
+### Phase 2: Building HTTP/1.1
+
+**The Target**
+We are building **HTTP/1.1**.
+* *Why not HTTP/2 or HTTP/3?*
+    * HTTP/1.1 is text-based and readable by humans.
+    * HTTP/2 and HTTP/3 are binary protocols optimized for performance, but they obscure the fundamental "Request/Response" semantics. To understand the web, you must master 1.1 first.
+
+**The Map: Request For Comments (RFCs)**
+The internet is built on documents called RFCs. They are the technical laws that browsers and servers must follow to talk to each other.
+
+
+
+**The RFC Landscape for HTTP/1.1**
+It is messy because the spec has been rewritten multiple times to be clearer.
+
+| RFC | Status | Description |
+| :--- | :--- | :--- |
+| **RFC 2616** | **Deprecated** | The old bible of HTTP. Do not read this. It is obsolete. |
+| **RFC 7231** | **Active** | Widely referenced, but very verbose. |
+| **RFC 9110** | **Semantics** | The dictionary. Defines *what* things mean (e.g., what a "404" is, what "GET" implies). |
+| **RFC 9112** | **Messaging** | The blueprint. Defines *how* to format the bytes on the wire. |
+
+**Our Strategy**
+We will focus on **RFC 9112** and **RFC 9110**.
+* **Why?** They separate the "Wire Format" (9112) from the "Meaning" (9110).
+* **RFC 9112** is concise and tells us exactly where to put the spaces and newlines.
+* **RFC 9110** tells us what to do once we parse those bytes.
+
+### HTTP Anatomy: GET vs. POST
+
+**1. The Shape of a Request**
+By capturing the output of `curl`, I can finally see what an HTTP request looks like on the wire.
+
+**A GET Request (No Body)**
+```http
+GET /goodies HTTP/1.1
+Host: localhost:42069
+User-Agent: curl/8.6.0
+Accept: */*
+```
+* **Request Line:** `Method Path Version`
+* **Headers:** Metadata about the request.
+* **Body:** Empty (for GET).
+
+**A POST Request (With Body)**
+```http
+POST /coffee HTTP/1.1
+Host: localhost:42069
+User-Agent: curl/8.6.0
+Accept: */*
+Content-Type: application/json
+Content-Length: 23
+
+{"flavor":"dark mode"}
+```
+* **Note:** There is always an empty line (CRLF) separating the headers from the body.
+
+---
+
+### The "Hanging Body" Problem
+
+**The Experiment**
+I sent a POST request with a JSON body:
+`curl -X POST -d '{"flavor":"dark mode"}' ...`
+
+**The Observation**
+1.  The headers printed immediately.
+2.  The program **hung**. The body `{"flavor":"dark mode"}` did not appear.
+3.  When I killed `curl`, the body suddenly appeared.
+
+
+
+**The Reason: The Flaw in "Line Reading"**
+My current TCP listener is designed to **read lines** (waiting for `\n`).
+* HTTP Headers *do* end in newlines.
+* HTTP Bodies **do not** necessarily end in newlines.
+
+The `curl` command sent the JSON data (no newline at the end) and then waited for a response. My server sat there waiting for a `\n` that never came. It only printed when the connection closed (EOF), forcing the buffer to flush.
+
+**Conclusion:** I cannot parse HTTP bodies using a simple `Scanner` or `ReadString('\n')`. I must read the headers, find the `Content-Length`, and then read exactly that many bytes.
+
+---
+
+### HTTP Parser Setup & Testing Philosophy
+
+**1. Project Structure: The `internal` Directory**
+- I created `internal/request`.
+- **Rule:** In Go, packages inside `internal/` are private. They can be imported by my code, but if someone else imports my project as a library, the compiler forbids them from accessing `internal`.
+- **Why:** The HTTP parser is the engine room. I don't want users importing it directly; they should use the public server API I build later.
+
+**2. Testing Strategy: Table-Driven vs. Assertions**
+
+| Feature | Table-Driven (Standard) | Assertions (Testify) |
+| :--- | :--- | :--- |
+| **Logic** | Loop over struct slice | Linear, step-by-step |
+| **Readability** | Compact, high abstraction | Verbose, explicit |
+| **Debugging** | Harder (generic error msgs) | Easier (line number = exact failure) |
+| **Use Case** | Simple inputs/outputs | Complex state & parsers |
+
+**Decision:** We are using **Procedural/Assert tests** because the parser logic will be complex. We want the tests to be "dumb" and explicit so we don't have to debug the tests themselves.
+
+---
+
+### HTTP Request Parser: Phase 1 (Request Line)
+
+**Goal:** Parse the "Start-Line" of an HTTP request (e.g., `GET /index.html HTTP/1.1`) while validating format and version.
+
+#### 1. The Strategy: "Slurp and Cut"
+Instead of reading byte-by-byte (complex), I opted for a simpler initial approach to get the logic working:
+1.  **Slurp:** Read the entire input into memory using `io.ReadAll`.
+2.  **Isolate:** Extract *only* the first line (`\r\n`).
+3.  **Parse:** Split that line into its three required components.
+
+#### 2. Key Technical Decisions
+
+**A. Using `bytes.Cut` over `strings.Split`**
+I used `bytes.Cut` for safety and precision.
+* **Safety:** `strings.Split` creates a slice of all parts. If the input is malformed, accessing `index[2]` causes a panic (crash). `bytes.Cut` returns a boolean `found` flag, allowing me to handle errors gracefully.
+* **Precision:** It splits on the *first* occurrence only, preventing me from accidentally chopping up data later in the string.
+
+**B. Isolating the Request Line**
+* **The Problem:** If I pass the whole request to the parser, it might find spaces inside the **Headers** and think they belong to the Request Line.
+* **The Fix:**
+    ```go
+    line, _, found := bytes.Cut(data, []byte("\r\n"))
+    ```
+    This ensures `parseRequestLine` only ever sees the first line (`GET / HTTP/1.1`), guaranteeing that any spaces found are actual delimiters.
+
+**C. Validation Rules**
+I implemented strict validation per RFC 9112/9110:
+1.  **Method:** Must be uppercase alphabetic characters (A-Z).
+    * *Implementation:* Iterated over bytes checking `char < 'A' || char > 'Z'`.
+2.  **Version:** Must be exactly `HTTP/1.1`.
+    * *Implementation:* I cut the prefix `HTTP/` (using `/` as separator) and strictly compared the remainder to `"1.1"`.
+
+#### 3. Code Walkthrough
+
+```go
+func RequestFromReader(reader io.Reader) (*Request, error) {
+    // ... read all data ...
+
+    // 1. ISOLATE the first line (Critical Step)
+    line, _, found := bytes.Cut(data, []byte("\r\n"))
+    if !found {
+        return nil, fmt.Errorf("invalid request: no newlines found")
+    }
+
+    // 2. Parse ONLY that line
+    requestLine, err := parseRequestLine(line)
+    // ...
+}
+
+func parseRequestLine(data []byte) (*RequestLine, error){
+    // 1. Extract Method (Separated by Space)
+    method, rest, found := bytes.Cut(data, []byte(" "))
+    if !found { return nil, Error... }
+
+    // 2. Extract Target (Separated by Space)
+    target, rest, found := bytes.Cut(rest, []byte(" "))
+    if !found { return nil, Error... }
+
+    // 3. Extract Version Prefix ("HTTP/")
+    _, rest, found = bytes.Cut(rest, []byte("/"))
+    if !found { return nil, Error... }
+
+    version := rest // Remainder is the version number (e.g. "1.1")
+
+    // 4. Validate Method (Uppercase only)
+    for _, char := range method {
+        if char < 'A' || char > 'Z' { return nil, Error... }
+    }
+
+    // 5. Validate Version (Must be 1.1)
+    if string(version) != "1.1" { return nil, Error... }
+
+    return &RequestLine{...}, nil
+}
+```
+
+#### 4. Future Optimization
+Currently, `io.ReadAll` reads the *entire* request (including potentially large bodies) just to parse the first line. In the future, I should switch to `bufio.Reader` to read line-by-line to 
+prevent memory exhaustion attacks.
+
+---
+
+### Phase 2: Streaming Architecture & State Machine
+
+**Goal:** Move away from "Slurp All" (which blocks and wastes memory) to a "Streaming" approach that handles data as it arrives in chunks.
+
+#### 1. The "Chunked Reading" Strategy
+Instead of waiting for the entire request to arrive (which might never happen in "Keep-Alive" connections), I implemented a buffer loop:
+1.  **Read:** Grab a small chunk (e.g., 1024 bytes) from the connection.
+2.  **Append:** Add it to a temporary buffer (`buf`).
+3.  **Try Parse:** Attempt to parse the buffer.
+4.  **Slice:** If parsing succeeded, remove the used bytes from the buffer. If not, keep them and wait for the next chunk.
+
+**Why this matters:**
+This allows the server to handle slow clients (who send `"G"`, wait 1 second, send `"ET"`) without hanging or crashing.
+
+#### 2. The State Machine Pattern
+I introduced a `parserState` enum to track progress. This turns the parser into a "Brain" that knows what to look for next.
+
+```go
+type parserState int
+const (
+    stateInitialized parserState = iota // 0: Waiting for Request Line
+    stateDone                           // 1: Finished (for now)
+)
+```
+
+**The logic flow:**
+* **Input:** `RequestFromReader` feeds raw bytes to `req.parse()`.
+* **Decision:** `req.parse()` checks `req.state`.
+    * If `Initialized` -> Call `parseRequestLine`.
+    * If `Done` -> Stop.
+
+#### 3. Handling Partial Data (The "0 Bytes" Rule)
+The most critical change is how `parseRequestLine` handles missing data.
+* **Old Way:** If `\r\n` is missing -> Error "Invalid Request".
+* **New Way:** If `\r\n` is missing -> Return `0` bytes consumed, `nil` error.
+
+This signals the main loop: *"I see data, but not enough to form a complete line. Please read more from the network and ask me again."*
+
+#### 4. Code Walkthrough: The Read Loop
+
+```go
+func RequestFromReader(reader io.Reader) (*Request, error) {
+    req := newRequest()
+    buf := make([]byte, 0)      // Accumulates data
+    chunk := make([]byte, 1024) // Temp read buffer
+
+    for req.state != stateDone {
+        // 1. Read from wire
+        numBytesRead, err := reader.Read(chunk)
+        
+        if err != nil {
+			if err != io.EOF {
+				return nil, err
+			}
+		}
+
+		if numBytesRead == 0 && err == io.EOF {
+			req.state = stateDone
+			break
+		}
+
+        // 2. Append to accumulator
+        buf = append(buf, chunk[:numBytesRead]...)
+
+        // 3. Try to parse
+        numBytesParsed, err := req.parse(buf)
+        if err != nil { return nil, err }
+
+        // 4. Slide the Window (Discard parsed bytes)
+        if numBytesParsed > 0 {
+            buf = buf[numBytesParsed:]
+        }
+    }
+    return &req, nil
+}
+```
+
+#### 5. The State Enum (Iota)
+To manage the parser's lifecycle, I created a custom type using Go's `iota` identifier. This allows me to define a sequence of related constants that automatically increment.
+
+```go
+type parserState int
+
+const (
+    stateInitialized parserState = iota // Value: 0
+    stateDone                           // Value: 1
+)
+```
+**Why:** This prevents "magic numbers" in the code. Instead of checking `if state == 0`, I check `if state == stateInitialized`, making the logic readable and type-safe.
+
+#### 6. Dynamic Error Constructors
+Instead of static error variables, I implemented **Error Constructor Functions**.
+
+```go
+func ErrorInvalidMethod(method string) error {
+    return fmt.Errorf("invalid method: %s", method)
+}
+
+func ErrorInvalidVersion(version string) error {
+    return fmt.Errorf("Unsupported HTTP Version: %s", version)
+}
+```
+**Why:** Static variables (like `var ErrInvalidMethod = ...`) cannot contain dynamic context. By using functions, I can include the *specific* invalid value (e.g., "GET123") in the error message, which is crucial for debugging.
+
+#### 7. The Parse "Router"
+The `parse` method is the heart of the state machine. It doesn't do the parsing itself; it decides *which* parser function to call based on the current state.
+
+```go
+func (r *Request) parse(p []byte) (int, error) {
+    numBytesParsed := 0
+outer:	
+	for {
+		switch r.state {
+		case stateInitialized:
+			// Try to parse the Request Line
+			rlp, numBytesParsed, _, err := parseRequestLine(p)
+			if err != nil {
+				return 0, err
+			}
+
+			// If numBytesParsed is 0, we need more data. Break and wait.
+			if numBytesParsed == 0 {
+				break outer
+			}
+
+			// Success: Update struct and State
+			r.RequestLine = *rlp
+			r.state = stateDone
+		case stateDone:
+			break outer // DO NOTHING!
+		}
+	}
+    return numBytesParsed, nil
+}
+```
+**Key Logic:**
+* **Input:** A slice of bytes (`p`).
+* **Output:** How many bytes were successfully used (`n`).
+* **Flow:** It checks `r.state`. If initialized, it calls `parseRequestLine`. If that succeeds, it transitions to `stateDone`.
+
+---
+
+### Phase 3: TCP Listener Integration & Concurrency
+
+**Goal:** Connect the generic `RequestFromReader` parser to a real TCP socket and handle multiple clients simultaneously.
+
+#### 1. The Interface Magic
+Connecting the components was seamless because `net.Conn` implements the `io.Reader` interface.
+* **Parser Expects:** `func RequestFromReader(reader io.Reader)`
+* **TCP Provides:** `conn, _ := ln.Accept()`
+* **Result:** I can pass the active network connection directly to the parser without any adapter code. This validates the decision to code against interfaces rather than concrete types.
+
+#### 2. Resource Management (The Defer Pattern)
+A critical issue in long-running servers is **Resource Leaks**.
+* **Problem:** If a connection is not closed, the File Descriptor remains open indefinitely. Eventually, the OS limits are reached ("Too many open files"), and the server crashes.
+* **Fix:** I applied the `defer` keyword immediately after accepting the connection.
+  ```go
+  defer conn.Close()
+  ```
+  This guarantees cleanup happens even if the parser panics or returns an error early.
+
+#### 3. Concurrency: Moving from Blocking to Non-Blocking
+The initial implementation handled requests in the main loop:
+1. Accept A -> 2. Process A -> 3. Accept B
+**Flaw:** If Client A is slow (or malicious), Client B is blocked forever.
+
+**The Fix (Goroutines):**
+I moved the processing logic into a generic background worker using `go func`.
+1. Accept A -> Spawn Worker for A (Background)
+2. Immediately Loop back to Accept B.
+
+#### 4. The "Loop Variable Closure" Trap (Critical Bug)
+I encountered a classic Go concurrency bug when using anonymous functions inside a `for` loop.
+
+**The Bug:**
+```go
+for {
+    conn, _ := ln.Accept()
+    go func() {
+        // DANGER: Using 'conn' from the outer loop!
+        handle(conn) 
+    }()
+}
+```
+Because the goroutine starts *after* a small delay, the main loop might have already accepted a *new* connection and updated the `conn` variable. The worker for Client A might accidentally read from Client B's connection.
+
+**The Solution (Shadowing):**
+I must pass the variable *into* the function to create a local copy.
+```go
+go func(c net.Conn) { // 'c' is a local copy strictly for this worker
+    handle(c)
+}(conn) // Pass current value here
+```
+
+**Code Walkthrough:**
+
+```Go
+func main() {
+	ln, err := net.Listen("tcp", ":42069")
+	// f, err := os.Open("../../message.txt")
+
+	if err != nil {
+		log.Fatal("error: ", err)
+	}
+	
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			fmt.Println("Error: ", err)
+			continue
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			fmt.Printf("Connection Has Been Accepted.\n")
+
+			// for line := range getLinesChannel(conn) {
+			// 	fmt.Printf("read: %s\n", line)
+			// }
+			req, err := request.RequestFromReader(c)
+
+			if err != nil {
+				fmt.Println("Error Getting Request: ", err)
+				return
+			}
+
+			fmt.Printf("Request line:\n- Method: %s\n- Target: %s\n- Version: %s", req.RequestLine.Method, req.RequestLine.RequestTarget, req.RequestLine.HttpVersion)
+
+			fmt.Printf("\nConeection Has Been Closed.\n")
+		}(conn)
+	}
+	
+}
+```
