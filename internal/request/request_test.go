@@ -4,7 +4,7 @@ import (
 	"io"
 	"strings"
 	"testing"
-	
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -86,7 +86,61 @@ func TestRequestLineParse(t *testing.T) {
 	// Test: Invalid Version (HTTP/1.0 or junk)
 	_, err = RequestFromReader(strings.NewReader("GET /coffee HTTP/1.0\r\nHost: localhost\r\n\r\n"))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid version")
+	assert.Contains(t, err.Error(), "Unsupported HTTP Version")
+}
+
+func TestRequestHeaders(t *testing.T) {
+	// 1. Standard Headers
+	reader := &chunkReader{
+		data:            "GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n",
+		numBytesPerRead: 10,
+	}
+	r, err := RequestFromReader(reader)
+	require.NoError(t, err)
+	assert.Equal(t, "localhost:42069", r.Headers["host"])
+	assert.Equal(t, "curl/7.81.0", r.Headers["user-agent"])
+	assert.Equal(t, "*/*", r.Headers["accept"])
+
+	// 2. Empty Headers
+	// Just a Request Line followed immediately by the blank line (\r\n)
+	r, err = RequestFromReader(strings.NewReader("GET / HTTP/1.1\r\n\r\n"))
+	require.NoError(t, err)
+	require.NotNil(t, r.Headers) // Map should be initialized
+	assert.Empty(t, r.Headers)   // But empty
+
+	// 3. Malformed Header (No Colon)
+	// We expect the parser to return an error when it hits "Host localhost"
+	readerMal := &chunkReader{
+		data:            "GET / HTTP/1.1\r\nHost localhost:42069\r\n\r\n",
+		numBytesPerRead: 10,
+	}
+	_, err = RequestFromReader(readerMal)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "malformed header")
+
+	// 4. Duplicate Headers (The Comma Logic)
+	// We expect multiple "My-List" headers to be combined
+	r, err = RequestFromReader(strings.NewReader("GET / HTTP/1.1\r\nMy-List: item1\r\nMy-List: item2\r\n\r\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "item1, item2", r.Headers["my-list"])
+
+	// 5. Case Insensitive Headers
+	// We send "CoNtEnT-LeNgTh", we expect to find it at key "content-length"
+	r, err = RequestFromReader(strings.NewReader("GET / HTTP/1.1\r\nCoNtEnT-LeNgTh: 42\r\n\r\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "42", r.Headers["content-length"])
+
+	// 6. Missing End of Headers (Edge Case)
+	// The stream ends abruptly. The parser should return what it has, 
+	// but the last incomplete header should NOT be present.
+	// Input: Valid Host, but incomplete User-Agent
+	incompleteData := "GET / HTTP/1.1\r\nHost: localhost\r\nUser-Age"
+	r, err = RequestFromReader(strings.NewReader(incompleteData))
+	
+	require.NoError(t, err) // It's not an error to run out of data (EOF)
+	assert.Equal(t, "localhost", r.Headers["host"]) // Host was fully parsed
+	_, exists := r.Headers["user-agent"]
+	assert.False(t, exists, "Should not have parsed incomplete User-Agent header")
 }
 
 

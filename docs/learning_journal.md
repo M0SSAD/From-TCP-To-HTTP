@@ -899,3 +899,264 @@ func main() {
 	
 }
 ```
+
+---
+
+### Phase 4: Parsing Headers
+
+**Goal:** Parse the headers section of the HTTP request into a `map[string]string`.
+
+#### 1. The Headers Package
+I created a dedicated package `headers` because headers are used in both Requests (parsing) and Responses (sending).
+* **Type:** `type Headers map[string]string`
+* **Constructor:** `func NewHeaders() Headers`
+
+#### 2. Field-Line Syntax (RFC 9110)
+Structure: `Key: Value\r\n`
+* **Colon Rule:** No whitespace allowed between the Key and the Colon (`Key : Val` is invalid).
+* **Value Rule:** Whitespace is allowed/ignored around the value (`Key:   Val   ` becomes `"Val"`).
+* **Indentation:** Historically, headers could be indented (folded), though modern HTTP discourages it. The parser supports it by trimming leading space from keys.
+
+#### 3. The Parse Loop Logic
+The `Parse` method parses **one header line at a time**.
+* **Input:** The raw byte slice starting from the current position.
+* **Logic:**
+    1.  Find the next `\r\n`.
+    2.  **Empty Line Check:** If `\r\n` is at index 0, we have hit the blank line separating Headers from Body. Return `done=true`.
+    3.  **Cut & Clean:** Split on the first colon (`:`). Check for spaces before the colon (Strict validation). Trim spaces around the value.
+    4.  **Store:** Add to the map.
+    5.  **Return:** Number of bytes consumed so the caller can advance the buffer.
+
+#### 4. Validating the "No Space Before Colon" Rule
+To satisfy the RFC requirement that `Host : localhost` is invalid, I implemented a specific check:
+```go
+// After cutting on ":", check the last byte of the key
+if key[len(key)-1] == ' ' {
+    return error
+}
+```
+
+#### 5. Code WalkThrough:
+
+```Go
+func (h Headers) Parse(data []byte) (n int, done bool, err error) {
+	//"       Host: localhost:42069       \r\n\r\n"
+	// Find First \r\n
+	// n += index(\r\n) + 2
+	// now I should parse the isolated header alone, then move the slice
+
+	idx := bytes.Index(data, []byte("\r\n"))
+	
+	if idx == -1 {
+		return 0, false, nil
+	}
+
+	if idx == 0 {
+		done = true
+		n += 2
+		return n, done, nil
+	}
+
+	
+	header := data[:idx]
+	
+	key, remaining, found := bytes.Cut(header, []byte(":"))
+	
+	if !found {
+		return 0, done, ERROR_CANNOT_PARSE_KEY_FROM_VALUE
+	}
+	
+	if len(key) == 0 {
+         return n, false, ERROR_MALFORMED_KEY
+    }
+
+	if key[len(key) - 1] == ' ' {
+		return 0, done, ERROR_INVALID_HEADER_SPACE_BETWEEN_KEY_AND_COLOUMN
+	}
+	
+	n += idx + 2
+	value := bytes.TrimSpace(remaining)
+	key = bytes.TrimLeft(key, " ")
+
+	h[string(key)] = string(value)
+	return n, done, nil
+}
+```
+---
+
+### Phase 4b: Header Validation & Normalization (RFC 9110)
+
+**Goal:** Enforce strict RFC compliance for Header Keys (Field Names) regarding allowed characters and case insensitivity.
+
+#### 1. The "Case Insensitivity" Problem
+In Lesson 1, `Host` and `host` were treated as two different keys in the map.
+* **The RFC:** "Field names are case-insensitive."
+* **The Implication:** `Content-Length` and `content-length` must act as the same key.
+* **The Fix:** I implemented **Normalization**. Before adding a key to the map, I convert it to lowercase. This ensures that `h["content-length"]` always retrieves the value, regardless of how the client sent it (e.g., `CoNtEnT-LeNgTh`).
+
+#### 2. Strict Character Validation (The Token Rule)
+Lesson 1 allowed any string as a key. Lesson 2 restricts this to valid "Tokens" defined in RFC 9110 Section 5.6.2.
+* **Allowed:** Alphanumeric (`a-z`, `0-9`) and specific symbols (`! # $ % & ' * + - . ^ _ ` | ~`).
+* **Forbidden:** Spaces, control characters, and other symbols (like `©`, `@`, `[`, `]`).
+
+#### 3. Implementation: The Validation Loop
+I refactored the parsing logic to include a pass over the key bytes.
+
+**What differs from Lesson 1:**
+Instead of just slicing bytes (`key := data[:idx]`), I now allocate a new slice (`normalizedKey`) and process it byte-by-byte.
+
+```go
+// 1. Create a safe lower case copy of the key
+normalizedKey := bytes.ToLower(key)
+for _, b := range normalizedKey {
+    if !isTokenChar(b) {
+        return n, done, ErrInvalidCharInKey
+    }
+}
+```
+
+#### 4. Helper Function: `isValidHeaderChar`
+To keep the main logic clean, I extracted the RFC character list into a helper function.
+* **Input:** `byte`
+* **Output:** `bool`
+* **Logic:** Checks ranges (`a-z`, `0-9`) and a `switch` statement for the specific allowed symbols.
+
+#### Summary of Changes
+
+| Feature | Lesson 1 (Basic) | Lesson 2 (Compliant) |
+| :--- | :--- | :--- |
+| **Map Keys** | Case-sensitive (`Host` != `host`) | **Normalized** (`host` == `Host`) |
+| **Invalid Chars** | Allowed (`H@st` was valid) | **Rejected** (`H@st` returns Error) |
+| **Safety** | Sliced original buffer | **Allocates** new key copy |
+
+
+---
+
+### Phase 4c: Handling Duplicate Headers (Multi-Value Fields)
+
+**Goal:** Handle cases where the client sends the same header key multiple times (e.g., `Set-Cookie`, `Via`, or custom lists).
+
+#### 1. The RFC Rule (RFC 9110 Section 5.2)
+HTTP allows a header field name to appear multiple times in a message. The receiver must treat this as a single header where the values are joined by a **comma**.
+
+**Example:**
+```text
+My-List: Item 1
+My-List: Item 2
+```
+Must become: `My-List: Item 1, Item 2`
+
+#### 2. Implementation
+I updated the map insertion logic to check for existence first.
+
+```go
+// 8. Update Map (Handle Duplicates)
+keyStr := string(normalizedKey)
+valStr := string(value)
+
+// Check if key already exists
+if existingValue, ok := h[keyStr]; ok {
+    // Found! Append with comma
+    h[keyStr] = existingValue + ", " + valStr
+} else {
+    // New key, just insert
+    h[keyStr] = valStr
+}
+```
+
+**Why string conversion?**
+I cast `normalizedKey` (byte slice) to `string` because Go maps require comparable types as keys, and `[]byte` (a slice) is not comparable. This allocation is necessary.
+
+---
+
+### Phase 5: Integrating Headers & The Parsing Loop
+
+**Goal:** Hook the standalone `Headers.Parse` logic into the main Request State Machine so we can parse a full HTTP request (Request Line + Headers).
+
+#### 1. The Challenge: The "Cursor Problem"
+In previous lessons, we only parsed one thing (the Request Line) at the start of the buffer. Now, we need to parse multiple things (Request Line -> Header 1 -> Header 2 -> ...).
+
+**The Bug:**
+If we simply loop and call `parse(data)`, the function always starts looking at index 0.
+1.  **Round 1:** Parses Request Line (`GET /...`). Success.
+2.  **Round 2:** Still looks at index 0! It sees `GET /...` again, but now it expects a Header. It fails because `GET` is not a valid header key.
+
+**The Fix (Sliding Window):**
+We need to "slide the window" forward after every successful parse. We do this by tracking `totalBytesParsed`.
+
+#### 2. The Solution: Driver vs. Logic Split
+To solve the cursor problem cleanly, I refactored the parsing into two distinct methods:
+
+**A. The Driver (`parse`)**
+* **Role:** Manages the loop and the cursor (`totalBytesParsed`).
+* **Logic:** It calls `parseSingle` with a slice of the data that *hasn't been parsed yet* (`data[totalBytesParsed:]`).
+* **Why:** This ensures the state machine always sees fresh data at index 0.
+
+**B. The Logic (`parseSingle`)**
+* **Role:** The State Machine. It looks at `r.state` and decides *what* to parse next.
+* **Logic:** It parses exactly **one item** (one request line OR one header) and returns how many bytes it used.
+
+#### 3. The New State: `requestStateParsingHeaders`
+I added a new state to the enum to bridge the gap between "Initialized" and "Done".
+
+* **Transition 1 (Init -> Headers):** After `parseRequestLine` succeeds, we switch to `requestStateParsingHeaders`.
+* **Transition 2 (Headers -> Done):** Inside the header loop, if `headers.Parse` returns `done=true` (meaning it found the empty line `\r\n`), we switch to `requestStateDone`.
+
+#### 4. Handling Partial Data (The "Safety Check")
+A critical edge case is when the stream cuts off in the middle of a header (e.g., `User-Ag`).
+
+* **The Behavior:** The parser waits for `\r\n`. If it doesn't find it, it returns `0 bytes consumed`.
+* **The Result:** The Driver loop sees `0` and breaks. The unparsed bytes remain in the buffer.
+* **Why this is safe:** It prevents the parser from crashing or inventing data. It effectively says, "I'm pausing here until the network sends the rest."
+
+#### 5. Final Code Structure
+
+```go
+// The Driver (Manages the Loop)
+func (r *Request) parse(data []byte) (int, error) {
+    totalBytesParsed := 0
+    for r.state != requestStateDone {
+        // Safety: Stop if we run out of data
+        if totalBytesParsed >= len(data) { break }
+
+        // Pass only the Remaining Data
+        n, err := r.parseSingle(data[totalBytesParsed:])
+        if err != nil { return totalBytesParsed, err }
+        
+        // Stop if we need more data
+        if n == 0 { break }
+
+        totalBytesParsed += n
+    }
+    return totalBytesParsed, nil
+}
+
+// The Logic (Manages the State)
+func (r *Request) parseSingle(data []byte) (int, error) {
+    switch r.state {
+    case requestStateInitialized:
+        // ... parse request line ...
+        r.state = requestStateParsingHeaders // Switch!
+        return n, nil
+
+    case requestStateParsingHeaders:
+        // Initialize map if needed
+        if r.Headers == nil { r.Headers = NewHeaders() }
+        
+        n, done, err := r.Headers.Parse(data)
+        // ... handle err ...
+        
+        if done {
+            r.state = requestStateDone // Finish!
+        }
+        return n, nil
+    }
+    return 0, nil
+}
+```
+
+#### 6. Verification (Tests)
+I added comprehensive tests to verify the integration:
+* **Case Insensitivity:** `CoNtEnT-TyPe` -> `content-type`
+* **Duplicate Headers:** `My-List: A` + `My-List: B` -> `My-List: A, B`
+* **Partial Data:** `User-Ag` (cutoff) -> safely ignored until more data arrives.

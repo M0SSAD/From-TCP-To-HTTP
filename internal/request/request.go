@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+
+	"boot.mossad.http/internal/headers"
 )
 
 // creating my enum
 type parserState int
 
 const (
-	stateInitialized parserState = iota
-	stateDone
+	requestStateInitialized parserState = iota
+	requestStateDone
+	requestStateParsingHeaders
 )
 
 type RequestLine struct {
@@ -22,6 +25,7 @@ type RequestLine struct {
 
 type Request struct {
 	RequestLine RequestLine
+	Headers headers.Headers
 	state parserState // 0 for initialized, 1 for done
 }
 
@@ -37,7 +41,7 @@ func ErrorInvalidVersion(version string) error {
 }
 
 func newRequest() Request {
-	return Request{state: stateInitialized}
+	return Request{state: requestStateInitialized}
 }
 
 // Read The request, agnostic approach, doesn't care if it is a stream of bytes or a full message.
@@ -61,7 +65,7 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
 	// store the chunks of bytes that will be added to the buf.
 	chunk := make([]byte, 1024)
 
-	for req.state != stateDone {
+	for req.state != requestStateDone {
 		numBytesRead, err := reader.Read(chunk)
 		if err != nil {
 			if err != io.EOF {
@@ -70,7 +74,7 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
 		}
 
 		if numBytesRead == 0 && err == io.EOF {
-			req.state = stateDone
+			req.state = requestStateDone
 			break
 		}
 
@@ -95,16 +99,23 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
 	
 }
 
-// A Helper function to change the state of the request based on if it got parsed
-// or not.
-// if n =0, with no error 
-// That means I need more chunks of data to parse.
+// This Doesn't work because:
+
+/*
+the parse function receives the slice p.
+    Round 1: parse the Request Line successfully. numBytesParsed becomes, say, 20. switch state to ParsingHeaders.
+    Round 2 (The Loop): still inside the for loop. hit the case requestStateParsingHeaders. call hs.Parse(p).
+Here is the bug: passed p again! p still starts at index 0 (GET / HTTP/1.1...).
+the Header Parser looks at that, sees it doesn't look like a header (Key: Value), and errors out (or returns 0).
+**/
+
+/*
 func (r *Request) parse(p []byte) (int, error) {
 	numBytesParsed := 0
 outer:	
 	for {
 		switch r.state {
-		case stateInitialized:
+		case requestStateInitialized:
 			// Try to parse the Request Line
 			rlp, numBytesParsed, _, err := parseRequestLine(p)
 			if err != nil {
@@ -118,13 +129,97 @@ outer:
 
 			// Success: Update struct and State
 			r.RequestLine = *rlp
-			r.state = stateDone
-		case stateDone:
+			r.state = requestStateParsingHeaders
+		case requestStateParsingHeaders:
+			hs := r.Headers
+			numBytesParsed, done, err := hs.Parse(p)
+			if err != nil {
+				return 0, err
+			}
+			if numBytesParsed == 0 {
+				break outer
+			}
+			if done {
+				r.state = requestStateDone
+			}
+		case requestStateDone:
 			break outer // DO NOTHING!
 		}
 	}
 	return numBytesParsed, nil
 }
+**/
+
+// A Helper function to change the state of the request based on if it got parsed
+// or not.
+// if n =0, with no error 
+// That means I need more chunks of data to parse.
+func (r *Request) parse(p []byte) (int, error) {
+	totalBytesParsed := 0
+	for r.state != requestStateDone{
+		if totalBytesParsed >= len(p) {
+            break 
+        }
+		n, err := r.parseSingle(p[totalBytesParsed:])
+
+		if err != nil {
+			return totalBytesParsed, err
+		}
+
+		if n == 0 {
+			break // wait for more chunks
+		}
+
+		totalBytesParsed += n
+
+	}
+	return totalBytesParsed, nil
+}
+
+
+func (r *Request) parseSingle(p []byte) (int, error) {
+	switch r.state {
+	case requestStateInitialized:
+		// Try to parse the Request Line
+		rlp, numBytesParsed, _, err := parseRequestLine(p)
+		if err != nil {
+			return 0, err
+		}
+
+		// If numBytesParsed is 0, we need more data. Break and wait.
+		if numBytesParsed == 0 {
+			return 0, nil
+		}
+
+		// Success: Update struct and State and return the number of bytes to move the data for the next loop
+		r.RequestLine = *rlp
+		r.state = requestStateParsingHeaders
+		return numBytesParsed, nil
+
+	case requestStateParsingHeaders:
+		if r.Headers == nil {
+            r.Headers = headers.NewHeaders()
+        }
+
+		// Parse exactly ONE header line (or the final empty line)
+		numBytesParsed, done, err := r.Headers.Parse(p)
+		if err != nil {
+			return 0, err
+		}
+
+		if numBytesParsed == 0 {
+            return 0, nil
+        }
+
+		if done {
+			r.state = requestStateDone
+		}
+		return numBytesParsed, nil
+	default:
+		return 0, nil // DO NOTHING!
+	}
+}
+
 
 // The Parser I will use to parse the request line
 // It returns, pointer to a struct of the RL, number of bytes parsed, 

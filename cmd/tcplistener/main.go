@@ -77,7 +77,15 @@ func main() {
 				return
 			}
 
-			fmt.Printf("Request line:\n- Method: %s\n- Target: %s\n- Version: %s", req.RequestLine.Method, req.RequestLine.RequestTarget, req.RequestLine.HttpVersion)
+			fmt.Printf("Request Line:\n- Method: %s\n- Target: %s\n- Version: %s\n", 
+				req.RequestLine.Method, 
+				req.RequestLine.RequestTarget, 
+				req.RequestLine.HttpVersion)
+
+			fmt.Println("Headers:")
+			for key, value := range req.Headers {
+				fmt.Printf("- %s: %s\n", key, value)
+			}
 
 			fmt.Printf("\nConeection Has Been Closed.\n")
 		}(conn)
