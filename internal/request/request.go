@@ -40,25 +40,19 @@ func newRequest() Request {
 	return Request{state: stateInitialized}
 }
 
+// Read The request, agnostic approach, doesn't care if it is a stream of bytes or a full message.
 func RequestFromReader(reader io.Reader) (*Request, error) {
-	// data, err := io.ReadAll(reader)
-
-	// if err != nil {
-	// 	if err != io.EOF{
-	// 		return nil, err
-	// 	}
-	// }
-
-	// line, _, found := bytes.Cut(data, []byte("\r\n"))
-    // if !found {
-    //     return nil, fmt.Errorf("invalid request: no newlines found")
-    // }
-
-	// requestLine, err := parseRequestLine(line)
-	// if err != nil {
-    //     return nil, err
-    // }
-	// return &Request{RequestLine: requestLine}, nil
+	/* // OLD LOGIC (ReadAll) - Kept for learning reference
+    data, err := io.ReadAll(reader)
+    if err != nil && err != io.EOF { return nil, err }
+    
+    line, _, found := bytes.Cut(data, []byte("\r\n"))
+    if !found { return nil, fmt.Errorf("invalid request: no newlines found") }
+    
+    requestLine, err := parseRequestLine(line)
+    if err != nil { return nil, err }
+    return &Request{RequestLine: *requestLine}, nil 
+    */
 
 	req := newRequest()
 
