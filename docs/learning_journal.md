@@ -1128,7 +1128,7 @@ func (r *Request) parse(data []byte) (int, error) {
 
         totalBytesParsed += n
     }
-    return totalBytesParsed, nil
+    return , nil
 }
 
 // The Logic (Manages the State)
@@ -1160,3 +1160,85 @@ I added comprehensive tests to verify the integration:
 * **Case Insensitivity:** `CoNtEnT-TyPe` -> `content-type`
 * **Duplicate Headers:** `My-List: A` + `My-List: B` -> `My-List: A, B`
 * **Partial Data:** `User-Ag` (cutoff) -> safely ignored until more data arrives.
+
+---
+
+### Phase 6: Parsing the Request Body
+
+**Goal:** Parse the optional message body (e.g., JSON payload in a POST request) based on the `Content-Length` header.
+
+#### 1. Struct Update
+I added a byte slice to hold the raw body data.
+
+```go
+type Request struct {
+    RequestLine RequestLine
+    Headers     headers.Headers
+    Body        []byte      // <--- New Field
+    state       parserState
+}
+```
+
+#### 2. The Logic: Handling "Content-Length"
+Parsing the body is different from headers because it is not terminated by a specific character (like `\r\n`). Instead, we must read exactly `Content-Length` bytes.
+
+**The State Transition:**
+I modified `requestStateParsingHeaders` to decide the next step dynamically:
+1.  **Headers Done:** When `headers.Parse` returns `done=true`.
+2.  **Check Content-Length:**
+    * **Missing:** Assume no body (standard for Requests). Transition to `stateDone`.
+    * **Present:** Transition to `stateParsingBody`.
+
+#### 3. The "Body" State Logic
+Inside `requestStateParsingBody`, the logic is:
+1.  **Read Target:** Parse `Content-Length` string to `int`.
+2.  **Consume:** Append **all** available bytes in the buffer to `r.Body`.
+3.  **Validate:**
+    * If `len(Body) > Content-Length`: **Error** (Payload too large).
+    * If `len(Body) == Content-Length`: **Success** (Transition to `stateDone`).
+    * If `len(Body) < Content-Length`: **Wait** (Return 0, wait for more TCP chunks).
+
+
+
+#### 4. Critical Fix: "Unexpected EOF"
+I encountered a bug where tests failed because the loop would exit successfully even if the body was incomplete (e.g., expected 100 bytes, got 50).
+
+**The Fix:**
+I added a validation check *after* the read loop in `RequestFromReader`.
+
+```go
+// Inside RequestFromReader...
+for req.state != requestStateDone {
+    // ... read loop ...
+    if n == 0 { break } // EOF
+}
+
+// VALIDATION: Did we actually finish?
+if req.state != requestStateDone {
+    return nil, fmt.Errorf("unexpected EOF: request incomplete")
+}
+```
+
+#### 5. Final Code Snippet (Body Parsing)
+
+```go
+case requestStateParsingBody:
+    // 1. Get Target Length
+    clVal := r.Headers.Get("Content-Length")
+    expectedLen, _ := strconv.Atoi(clVal)
+
+    // 2. Accumulate Data
+    r.Body = append(r.Body, p...)
+
+    // 3. Validation
+    if len(r.Body) > expectedLen {
+        return len(p), fmt.Errorf("body length %d exceeds Content-Length %d", len(r.Body), expectedLen)
+    }
+
+    // 4. Completion
+    if len(r.Body) == expectedLen {
+        r.state = requestStateDone
+    }
+
+    return len(p), nil
+```

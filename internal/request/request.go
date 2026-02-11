@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 
 	"boot.mossad.http/internal/headers"
 )
@@ -11,27 +12,41 @@ import (
 // creating my enum
 type parserState int
 
+// States of the request
+// Initialized -> Required parsing the request_line
+// ParsingHeaders -> In the process of parsing the headers
+// ParsingBody -> Obviously won't create the next gen fighters
+// stateDone -> finished processing this request
 const (
 	requestStateInitialized parserState = iota
-	requestStateDone
 	requestStateParsingHeaders
+	requestStateParsingBody
+	requestStateDone
 )
 
+// request line consists of (GET /Path HTTP/1.1) 
 type RequestLine struct {
-	HttpVersion   string
-	RequestTarget string
-	Method        string
+	HttpVersion   string // 1.1
+	RequestTarget string // Path
+	Method        string // GET
 }
 
+// Request consists of, RequestLine, Map for the headers, body and the state of processing.
 type Request struct {
 	RequestLine RequestLine
 	Headers headers.Headers
+	Body []byte
 	state parserState // 0 for initialized, 1 for done
 }
 
 var ERROR_PARSING_METHOD_IN_REQUEST_LINE = fmt.Errorf("invalid request line: parsing method")
 var ERROR_PARSING_TARGET_IN_REQUEST_LINE = fmt.Errorf("invalid request line: parsing target")
 var ERROR_PARSING_HTTP_VERSION_IN_REQUEST_LINE = fmt.Errorf("invalid request line: parsing HTTP version")
+var ERROR_PARSING_BODY_INVALID_CONTENT_LENGTH = fmt.Errorf("invalid content-length: content-length doesn't match the body size")
+var ERROR_UNEXPECTED_EOF = fmt.Errorf("unexpected end of file")
+
+
+
 func ErrorInvalidMethod(method string) error {
     return fmt.Errorf("invalid method: %s", method)
 }
@@ -45,8 +60,9 @@ func newRequest() Request {
 }
 
 // Read The request, agnostic approach, doesn't care if it is a stream of bytes or a full message.
+// Meaning I can read now from a file or a network stream.
 func RequestFromReader(reader io.Reader) (*Request, error) {
-	/* // OLD LOGIC (ReadAll) - Kept for learning reference
+	/* // OLD LOGIC (ReadAll) - Kept for learning reference -> Implemented for files first, then moved to network streams...
     data, err := io.ReadAll(reader)
     if err != nil && err != io.EOF { return nil, err }
     
@@ -57,50 +73,60 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
     if err != nil { return nil, err }
     return &Request{RequestLine: *requestLine}, nil 
     */
-
+	
+	// Initialize the request
 	req := newRequest()
 
-	// store the data that didn't get parsed yet.
+	// store the bytes to be parsed.
 	buf := make([]byte, 0)
-	// store the chunks of bytes that will be added to the buf.
+	
+	// store the chunks of bytes from the network stream.
 	chunk := make([]byte, 1024)
 
+
 	for req.state != requestStateDone {
-		numBytesRead, err := reader.Read(chunk)
+		numBytesRead, err := reader.Read(chunk) // read the bytes into chunk slice.
 		if err != nil {
 			if err != io.EOF {
-				return nil, err
+				return nil, err // return error only if not the EOF.
+			}
+			if err == io.EOF && req.state == requestStateParsingBody && numBytesRead == 0 {
+					break
 			}
 		}
 
+
+		// No bytes read, and Reached the EOF means the request is done.
 		if numBytesRead == 0 && err == io.EOF {
 			req.state = requestStateDone
 			break
 		}
 
-		// n is the length of the data in the chunk
+		// add the read data into the buffer to be parsed
 		buf = append(buf, chunk[:numBytesRead]...)
 
-		// Parse from the buffer
+
+		// Parse the bytes
 		numBytesParsed, err := req.parse(buf)
 
 		if err != nil {
 			return nil, err
 		}
 
-		// if I parsed some data, move the slice forward
-		// to skip the parsed data.
+		// remove the parsed bytes from the buffer.
 		if numBytesParsed > 0 {
 			buf = buf[numBytesParsed:]
 		}
 	}
 
-	return &req, nil
-	
+	if req.state != requestStateDone {
+        return nil, ERROR_UNEXPECTED_EOF
+    }
+
+    return &req, nil
 }
 
-// This Doesn't work because:
-
+// The next method didn't work because:
 /*
 the parse function receives the slice p.
     Round 1: parse the Request Line successfully. numBytesParsed becomes, say, 20. switch state to ParsingHeaders.
@@ -108,6 +134,8 @@ the parse function receives the slice p.
 Here is the bug: passed p again! p still starts at index 0 (GET / HTTP/1.1...).
 the Header Parser looks at that, sees it doesn't look like a header (Key: Value), and errors out (or returns 0).
 **/
+
+// So, I divided the parse into two functions as boot.dev adviced.
 
 /*
 func (r *Request) parse(p []byte) (int, error) {
@@ -178,6 +206,7 @@ func (r *Request) parse(p []byte) (int, error) {
 
 
 func (r *Request) parseSingle(p []byte) (int, error) {
+// Every line requires a loop to be parsed.
 	switch r.state {
 	case requestStateInitialized:
 		// Try to parse the Request Line
@@ -197,6 +226,7 @@ func (r *Request) parseSingle(p []byte) (int, error) {
 		return numBytesParsed, nil
 
 	case requestStateParsingHeaders:
+		// Initialize the headers map
 		if r.Headers == nil {
             r.Headers = headers.NewHeaders()
         }
@@ -211,10 +241,40 @@ func (r *Request) parseSingle(p []byte) (int, error) {
             return 0, nil
         }
 
+		// Will only happen when it reachs the empty line.
 		if done {
+            // Check if we expect a body
+            _, err := r.Headers.Get([]byte("Content-Length"))
+           	if err != nil {
+				r.state = requestStateDone
+			} else {
+                r.state = requestStateParsingBody
+            }
+        }
+
+		return numBytesParsed, nil
+	case requestStateParsingBody:
+		cl, err := r.Headers.Get([]byte("Content-Length"))
+		if err != nil {
+			r.state = requestStateDone
+			return 0, nil
+		}
+		contentLength, err := strconv.Atoi(cl)
+		if err != nil {
+			return 0, err
+		}
+		r.Body = append(r.Body, p...)
+		bytesConsumed := len(p)
+
+		if len(r.Body) > contentLength {
+			return bytesConsumed, ERROR_PARSING_BODY_INVALID_CONTENT_LENGTH
+		}
+
+		if len(r.Body) == contentLength {
 			r.state = requestStateDone
 		}
-		return numBytesParsed, nil
+		return bytesConsumed, nil
+
 	default:
 		return 0, nil // DO NOTHING!
 	}
@@ -271,3 +331,4 @@ func parseRequestLine(data []byte) (*RequestLine, int, []byte, error){
 	// requestLine.RequestTarget = strs[1]
 	// requestLine.HttpVersion = strs[2]
 }
+
