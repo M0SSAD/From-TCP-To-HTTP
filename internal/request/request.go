@@ -184,10 +184,13 @@ outer:
 // That means I need more chunks of data to parse.
 func (r *Request) parse(p []byte) (int, error) {
 	totalBytesParsed := 0
+	// loop until the state of the request is done.
 	for r.state != requestStateDone{
+		// if the parsed bytes is larger than the data sent, break the loop to notify that I need more bytes or the processing had finished
 		if totalBytesParsed >= len(p) {
             break 
         }
+		// parse the bytes
 		n, err := r.parseSingle(p[totalBytesParsed:])
 
 		if err != nil {
@@ -201,6 +204,7 @@ func (r *Request) parse(p []byte) (int, error) {
 		totalBytesParsed += n
 
 	}
+	// return parsed bytes to remove from the buffer
 	return totalBytesParsed, nil
 }
 
@@ -254,7 +258,9 @@ func (r *Request) parseSingle(p []byte) (int, error) {
 
 		return numBytesParsed, nil
 	case requestStateParsingBody:
+		// get the value of the content-length
 		cl, err := r.Headers.Get([]byte("Content-Length"))
+		// no content-length -> state is done, ignore the body if it exists.
 		if err != nil {
 			r.state = requestStateDone
 			return 0, nil
@@ -263,16 +269,21 @@ func (r *Request) parseSingle(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		// append the body bytes to our reqeust structure
 		r.Body = append(r.Body, p...)
+		// how many bytes were added to our body
 		bytesConsumed := len(p)
 
+		// if the body in our structure exceeds the give content-length: error
 		if len(r.Body) > contentLength {
 			return bytesConsumed, ERROR_PARSING_BODY_INVALID_CONTENT_LENGTH
 		}
-
+		
+		// doesn't change state until the full body is read
 		if len(r.Body) == contentLength {
 			r.state = requestStateDone
 		}
+
 		return bytesConsumed, nil
 
 	default:

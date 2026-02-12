@@ -177,7 +177,7 @@ func TestRequestBody(t *testing.T) {
 		data: "POST /submit HTTP/1.1\r\n" +
 			"Content-Length: 5\r\n" + 
 			"\r\n" +
-			"123456", // 6 bytes
+			"123456789", // 6 bytes
 		numBytesPerRead: 10,
 	}
 	_, err = RequestFromReader(readerLong)

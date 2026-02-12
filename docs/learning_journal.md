@@ -1242,3 +1242,55 @@ case requestStateParsingBody:
 
     return len(p), nil
 ```
+
+---
+
+### Phase 7: Building the HTTP Server (Concurrency & Signals)
+
+**Goal:** Transform the project from a library into a running executable that listens on a TCP port and returns a hardcoded HTTP response.
+
+#### 1. Server Architecture
+I implemented a `Server` struct that encapsulates the `net.Listener`. The architecture follows a standard Go pattern for network servers:
+
+* **Main Thread:** Initializes the server and waits for a shutdown signal (`SIGINT`/`SIGTERM`).
+* **Listen Goroutine:** A dedicated background loop that calls `listener.Accept()`. It blocks until a client connects.
+* **Handle Goroutines:** Every new connection spawns its own goroutine (`go s.handle(conn)`). This ensures one slow client cannot block others.
+
+
+
+#### 2. Graceful Shutdown (The `atomic.Bool` Pattern)
+A common problem in network servers is "closing the listener while the loop is running."
+
+**The Problem:**
+When `main` calls `server.Close()`, the listener closes. The `Accept()` call in the background loop immediately returns an error. We need to distinguish between "Server Crashed" (bad) and "Server Closed by User" (good).
+
+**The Fix:**
+I used `sync/atomic.Bool` to track the shutdown state.
+
+```go
+func (s *Server) listen() {
+    for {
+        conn, err := s.listener.Accept()
+        if err != nil {
+            // Check if this error was intentional
+            if s.isClosed.Load() {
+                return // Exit gracefully
+            }
+            // Otherwise, log the error and continue
+            fmt.Printf("Accept error: %v\n", err)
+            continue
+        }
+        go s.handle(conn)
+    }
+}
+```
+
+#### 3. The Hardcoded Response
+For now, the server ignores the request content and sends a fixed HTTP/1.1 response.
+
+* **Status Line:** `HTTP/1.1 200 OK`
+* **Headers:** `Content-Type: text/plain`, `Content-Length: 13`
+* **Body:** `Hello World!\n` (13 bytes total)
+
+**Key Detail:** HTTP requires `\r\n` (CRLF) for line endings in the header section.
+

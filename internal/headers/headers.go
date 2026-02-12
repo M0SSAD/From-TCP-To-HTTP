@@ -91,6 +91,11 @@ func (h Headers) Get(key []byte) (value string, err error) {
 	return i, nil
 }
 
+func (h Headers) Set(key string, value string) {
+	keyStr := bytes.ToLower([]byte(key))
+	h[string(keyStr)] = string(value)
+}
+
 func isTokenChar(b byte) bool {
     // 1. Check Contiguous Ranges
     if (b >= 'a' && b <= 'z') || 
